@@ -22,7 +22,7 @@ const int button_pin=4 ;  //Button or relay driven by x10 switch for manual cont
 const char* ssid     = "<ssid>";           // WIFI SSID
 const char* password = "<password>";       // WIFI password   
 /* MQTT setup */
-const char* mqtt_server ="192.168.10.155";
+const char* mqtt_server ="<mqtt_broker_ip";
 const char* topic_setting = "OpenHab/blind1/setting";
 const char* topic_status = "OpenHab/blind1/status";
 
