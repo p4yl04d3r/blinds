@@ -1,0 +1,6 @@
+sitemap home label="My Home"
+{
+        Frame label="Blinds" {
+                Switch item=blind1 mappings=[Open="Open",Half="Half",Close="Close"]
+        }
+}
