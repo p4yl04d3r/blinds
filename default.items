@@ -1,0 +1,1 @@
+String blind1 "Office blinds [%s]" <blind1> (All) {mqtt=">[mosquitto:OpenHab/blind1/setting:command:Open:90],>[mosquitto:OpenHab/blind1/setting:command:Close:5],>[mosquitto:OpenHab/blind1/setting:command:Half:45],<[mosquitto:OpenHab/blind1/status:state:default]"}
