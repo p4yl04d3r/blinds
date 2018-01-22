@@ -1,4 +1,4 @@
-# blinds
+# Venetian blinds
  Wifi blind controller for ESP8266.
 
   This project was created to open and close blinds.  
