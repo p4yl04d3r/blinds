@@ -1,183 +1,537 @@
-/*
- * Garage door controller in arduino
- * Board ESP12-E NodeMCU 1.0
- */
-
-#include <Servo.h>  
-#include <ESP8266WiFi.h>
+/******************************************************************************************************
+ * Wifi blind controller for ESP8266.
+ * 
+ * This project was created to open and close blinds.  
+ * The design of this sketch is to control blinds (up to 3 in a group) locally or via Openhab.
+ * Local control will give you 4 modes of movment (CloseUp(180), Open(90), Half(45), Close(0)).
+ * 
+ * This version of the sketch adds the ESP WIFI Configuration manager.  You no longer need to hardcode 
+ * settings into the code (Although defaluts can be definied).
+ * The configuration portal is started with SSID "Wblind-AP" at IP address "192.168.4.1" (default). 
+ * The settings are stored on the ESP in non-volitile flash FS. 
+ * If you need to enter back into the WIFI Configuration manager, you can press the "flash" button while 
+ * the device is powered on and the ESP will reset and start the configuration portal. You will have to save
+ * the settings in order to have the ESP restart normally as a hidden value is set in the flash filesystem.
+ * If the ESP does not restart after saving settings, you will have to press the reset button. There seems 
+ * to be a bug in the "ESP.reset()" function which hangs the ESP watchdog timer.
+ * 
+ * Also added in the sketch is the ability to tweek the tilt in software so that server setting at 90 
+ * degrees will have the blind open at a perfect 90.
+ * Also enable/disable blinds if you only have 1 or 2 blinds in a group.
+ * 
+ * I am using Masquito as the MQTT broker (any will work) and OpenHab as the backend.
+ * See the readme.md for more info on the project and source files for Openhab and the blind server mounts.
+ * 
+ * Arduino IDE settings:
+ *   Arduino Core ESP8266 - 2.3.0
+ *   Wifi Manager         - 0.12.0
+ *   Board: NodeMCU 1.0
+ *          Flash: 4M (1M SPIFFS)
+ *          Freq:  80mhz
+ *          Baud:  115200
+ *          
+ *   Needed Pins on NodeMCU board vs bare ESP:
+ *   ESP      NodeMCU   Usage:
+ *   ----------------------------------------------------
+ *   Reset      RST     Reset pin
+ *    0         D3      Trigger Configuration manager
+ *    4         D2      Pull cord blind toggle switch
+ *    12        D6      Server control for Blind2
+ *    13        D7      Server control for Blind1
+ *    14        D5      Server control for Blind3
+ *    
+ * Updates:
+ * 07/05/2016 - Inital public release
+ * 01/22/2018 - Added Wifi manager
+ *              A way to adjust the open tilt angle when working with blind clusters
+ *              Code cleanup
+ ******************************************************************************************************/
+#include <FS.h>                   //this needs to be first, or it all crashes and burns...
+#include <ESP8266WiFi.h>          //https://github.com/esp8266/Arduino
+#include <DNSServer.h>
+#include <ESP8266WebServer.h>
+#include <WiFiManager.h>          //https://github.com/tzapu/WiFiManager
+#include <ArduinoJson.h>          //https://github.com/bblanchon/ArduinoJson
+#include <Servo.h>
 #include <PubSubClient.h>
+#include <TimeLib.h>
+#include <TimeAlarms.h>
 
-/* Setup number of servos */
-#define SERVO1
-//#define SERVO2
-//#define SERVO3
+/* Define ESP8266 PIN assignments */
+//ADC_MODE(ADC_VCC);          /* Setup ADC pin to read VCC voltage (broken in current CC */
+#define TRIGGER_PIN 0         /* Pin used to put the esp into configuration portal */
+#define BUTTON_PIN  4         /* Pin used as the pull cord to move blinds locally */
+/* Configure GPIO servo pins */
+#define SERVOPIN1 13          /* Pin for servo1 */
+#define SERVOPIN2 12          /* Pin for servo2 */
+#define SERVOPIN3 14          /* Pin for servo3 */
+
 /* ENABLE DEBUG */
 int debug = 1;            //Set this to 1 for serial debug output
-/* Configure GPIO servo pins*/
-const int servoPin1=5;     //Pin for servo1
-//const int servoPin2=12;     //Pin for servo2
-//const int servoPin3=14;     //Pin for servo3
-const int button_pin=4 ;  //Button or relay driven by x10 switch for manual control
-/* WIFI setup */
-const char* ssid     = "<ssid>";           // WIFI SSID
-const char* password = "<password>";       // WIFI password   
-/* MQTT setup */
-const char* mqtt_server ="<mqtt_broker_ip";
-const char* topic_setting = "OpenHab/blind1/setting";
-const char* topic_status = "OpenHab/blind1/status";
+
+//define your default values here, if there are different values in config.json, they are overwritten.
+char mqtt_server[40]    = "192.168.10.155"; // MQTT Server address
+char mqtt_port[6]       = "1883";           // MQTT Port number
+char mqtt_token[34]     = "MQTT_TOKEN";     // Used for password token
+char topic_setting[40]  = "setting";        // MQTT SUBSCRIBE path to get openhab changes.
+char topic_status[40]   = "status";         // MQTT PUBLISG path to post blind status.
+char enable_blind1[2]   = "1";              // 1=Enable 0=Disable blind1
+char enable_blind2[2]   = "1";              // 1=Enable 0=Disable blind2
+char enable_blind3[2]   = "1";              // 1=Enable 0=Disable blind3
+char blind1_0_offset[3] = "90";             // +-90 degrees for blind1. Valid values 87-93.
+char blind2_0_offset[3] = "90";             // +-90 degrees for blind2. Valid values 87-93.
+char blind3_0_offset[3] = "90";             // +-90 degrees for blind3. Valid values 87-93.
+char configure_flag[2]  = "0";              // 0=Used to start configuration portal. Do not change.
+
+//flag for saving data
+bool shouldSaveConfig = false;
 
 /* Blind tilt settings */
-const int OPEN=90;       //Global settings for open
-const int HALF=45;       //Global settings for half way opened
-const int CLOSE=0;       //Global settings for close in down position
-const int CLOSEUP=180;   //Global setting to close in the up position
-/***********************************************************************************/
-WiFiClient espClient;
-PubSubClient client(espClient);
+const int OPEN = 90;                     //Global settings for open. Can change based on offset value.
+const int HALF = 45;                     //Global settings for half way opened. Can change based on offset value.
+const int CLOSE = 0;                     //Global settings for close in down position
+const int CLOSEUP = 180;                 //Global setting to close in the up position
+/* Initial Blind status */
+String blind1 = "unknown";   /* Initial state of blind1 */
 
-Servo myservo;     // create servo object to control a servo 
-int button_value;  //high or low button values
-int next=1;
+int button_value;                       //high or low button values
+int next = 1;
 
-void setup(void) {
-  Serial.begin(9600); //Comment out this line if you don't want debugging enabled
-  pinMode(button_pin, INPUT_PULLUP);
-  setup_wifi();
-  delay(100);
-  client.setServer(mqtt_server, 1883);
-  client.setCallback(callback);
-  moveblinds(CLOSEUP);         // call function to close all blinds
-  client.connect("ESPBlind1");
-  client.subscribe(topic_setting);
-  client.publish(topic_status, "Closed");   // publish current position at powerup
+//callback notifying us of the need to save config
+void saveConfigCallback () {
+  debug and Serial.println("Should save config");
+  shouldSaveConfig = true;
 }
 
-void setup_wifi() {
-  // We start by connecting to a WiFi network
+Servo myservo1;                       // create servo object for servo1
+Servo myservo2;                       // create servo object for servo2
+Servo myservo3;                       // create servo object for servo3
+
+WiFiClient espClient1;
+PubSubClient client(espClient1);
+
+ /*--------------------------------------------Setup-----------------------------------*/
+void setup() {
+  pinMode(TRIGGER_PIN, INPUT);
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  // put your setup code here, to run once:
+  Serial.begin(115200);
   debug and Serial.println();
-  debug and Serial.print("Connecting to ");
-  debug and Serial.println(ssid);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-  delay(20);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    debug and Serial.print(".");
+
+  //clean FS, for testing
+  //SPIFFS.format();
+
+  //read configuration from FS json
+  debug and Serial.println("mounting FS...");
+
+  if (SPIFFS.begin()) {
+    Serial.println("mounted file system");
+    if (SPIFFS.exists("/config.json")) {
+      //file exists, reading and loading
+      debug and Serial.println("reading config file");
+      File configFile = SPIFFS.open("/config.json", "r");
+      if (configFile) {
+        debug and Serial.println("opened config file");
+        size_t size = configFile.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+        DynamicJsonBuffer jsonBuffer;
+        JsonObject& json = jsonBuffer.parseObject(buf.get());
+        json.printTo(Serial);
+        if (json.success()) {
+          debug and Serial.println("\nparsed json");
+
+          strcpy(mqtt_server, json["mqtt_server"]);
+          strcpy(mqtt_port, json["mqtt_port"]);
+          strcpy(mqtt_token, json["mqtt_token"]);
+          strcpy(topic_setting, json["topic_setting"]);
+          strcpy(topic_status, json["topic_status"]);
+          strcpy(enable_blind1, json["enable_blind1"]);
+          strcpy(enable_blind2, json["enable_blind2"]);
+          strcpy(enable_blind3, json["enable_blind3"]);
+          strcpy(blind1_0_offset, json["blind1_0_offset"]);
+          strcpy(blind2_0_offset, json["blind2_0_offset"]);
+          strcpy(blind3_0_offset, json["blind3_0_offset"]);
+          strcpy(configure_flag, json["configure_flag"]);
+
+        } else {
+          Serial.println("failed to load json config");
+        }
+      }
+    }
+  } else {
+    Serial.println("failed to mount FS");
   }
-  debug and Serial.println("");
-  debug and Serial.println("WiFi connected");
-  debug and Serial.print("IP address: ");
+  //end read
+
+  // The extra parameters to be configured (can be either global or just in the setup)
+  // After connecting, parameter.getValue() will get you the configured value
+  // id/name placeholder/prompt default length
+  WiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqtt_server, 40);
+  WiFiManagerParameter custom_mqtt_port("port", "mqtt port", mqtt_port, 5);
+  WiFiManagerParameter custom_mqtt_token("mqtt", "mqtt token", mqtt_token, 32);
+  WiFiManagerParameter custom_topic_setting("blind1_sub", "mqtt blind1 sub", topic_setting, 40);
+  WiFiManagerParameter custom_topic_status("blind1_pub", "mqtt blind1 pub", topic_status, 40);
+  WiFiManagerParameter custom_enable_blind1("enable_blind1", "Enable blind 1", enable_blind1, 2);
+  WiFiManagerParameter custom_enable_blind2("enable_blind2", "Enable blind 2", enable_blind2, 2);
+  WiFiManagerParameter custom_enable_blind3("enable_blind3", "Enable blind 3", enable_blind3, 2);
+  WiFiManagerParameter custom_blind1_0_offset("blind1_0_offset", "blind1 offset", blind1_0_offset, 3);
+  WiFiManagerParameter custom_blind2_0_offset("blind2_0_offset", "blind2 offset", blind2_0_offset, 3);
+  WiFiManagerParameter custom_blind3_0_offset("blind3_0_offset", "blind3 offset", blind3_0_offset, 3);
+  WiFiManagerParameter custom_configure_flag("configure_flag", "configure flag", configure_flag, 2);
+
+  //WiFiManager
+  //Local intialization. Once its business is done, there is no need to keep it around
+  WiFiManager wifiManager;
+
+  //set config save notify callback
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+
+  //set static ip
+  //wifiManager.setSTAStaticIPConfig(IPAddress(10,0,1,99), IPAddress(10,0,1,1), IPAddress(255,255,255,0));
+
+  //add all your parameters here for web portal
+  WiFiManagerParameter custom_text1("<p>MQTT setup</p>");
+  wifiManager.addParameter(&custom_text1);
+  wifiManager.addParameter(&custom_mqtt_server);
+  wifiManager.addParameter(&custom_mqtt_port);
+  wifiManager.addParameter(&custom_mqtt_token);
+  WiFiManagerParameter custom_text2("<p>Blind setup</p>");
+  wifiManager.addParameter(&custom_text2);
+  wifiManager.addParameter(&custom_topic_setting);
+  wifiManager.addParameter(&custom_topic_status);
+  WiFiManagerParameter custom_text3("<p>To enable a blind set value to 1.</p>");
+  wifiManager.addParameter(&custom_text3);
+  wifiManager.addParameter(&custom_enable_blind1);
+  wifiManager.addParameter(&custom_enable_blind2);
+  wifiManager.addParameter(&custom_enable_blind3);
+  WiFiManagerParameter custom_text4("<p>Blind midpoint between 87 and 93. 90 is midpoint</p>");
+  wifiManager.addParameter(&custom_text4);
+  wifiManager.addParameter(&custom_blind1_0_offset);
+  wifiManager.addParameter(&custom_blind2_0_offset);
+  wifiManager.addParameter(&custom_blind3_0_offset);
+//  wifiManager.addParameter(&custom_configure_flag);
+
+  //reset settings - for testing
+  //wifiManager.resetSettings();
+
+  //set minimum quality of signal so it ignores AP's under that quality
+  //defaults to 15%
+  wifiManager.setMinimumSignalQuality(15);
+
+  //fetches ssid and pass and tries to connect
+  //if it does not connect it starts an access point with the specified name
+  //here  "Wblind-AP"
+  //and goes into a blocking loop awaiting configuration
+  debug and Serial.print("Configuration flag: ");
+  debug and Serial.println(configure_flag);
+  if (strcmp(configure_flag, "0") == 0 ) {  // If config flag is 0 then enter wifi setup.
+    Serial.println("\nEntering Configurations portal");
+    if (!wifiManager.startConfigPortal("Wblind-AP", "password")) {
+      Serial.println("failed to connect and hit timeout");
+      delay(3000);
+      //reset and try again, or maybe put it to deep sleep
+      ESP.reset();
+      delay(5000);
+    }
+  }
+  //Sets timeout until configuration portal gets turned off
+  //useful to make it all retry or go to sleep
+  //in seconds
+  wifiManager.setTimeout(30);
+  //We need to run autoconnect to actually connect to WIFI. 
+  //fetches ssid and pass and tries to connect
+  //if it does not connect it starts an access point with the specified name
+  //here  "Wblind-AP"
+  //and goes into a blocking loop awaiting configuration
+  if (!wifiManager.autoConnect("Wblind-AP", "password")) {
+    Serial.println("failed to connect and hit timeout");
+    delay(3000);
+    //reset and try again, or maybe put it to deep sleep
+    ESP.reset();
+    delay(5000);
+  }
+  
+  //if you get here you have connected to the WiFi
+  debug and Serial.println("connected...yeey :)");
+  debug and Serial.println("local ip");
   debug and Serial.println(WiFi.localIP());
-}
+  
+  //read updated parameters
+  strcpy(mqtt_server, custom_mqtt_server.getValue());
+  strcpy(mqtt_port, custom_mqtt_port.getValue());
+  strcpy(mqtt_token, custom_mqtt_token.getValue());
+  strcpy(topic_setting, custom_topic_setting.getValue());
+  strcpy(topic_status, custom_topic_status.getValue());
+  strcpy(enable_blind1, custom_enable_blind1.getValue());
+  strcpy(enable_blind2, custom_enable_blind2.getValue());
+  strcpy(enable_blind3, custom_enable_blind3.getValue());
+  strcpy(blind1_0_offset, custom_blind1_0_offset.getValue());
+  strcpy(blind2_0_offset, custom_blind2_0_offset.getValue());
+  strcpy(blind3_0_offset, custom_blind3_0_offset.getValue());
+  strcpy(configure_flag, custom_configure_flag.getValue());
 
+  //save the custom parameters to FS
+  if (shouldSaveConfig) {
+    Serial.println("saving config");
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& json = jsonBuffer.createObject();
+    json["mqtt_server"] = mqtt_server;
+    json["mqtt_port"] = mqtt_port;
+    json["mqtt_token"] = mqtt_token;
+    json["topic_setting"] = topic_setting;
+    json["topic_status"] = topic_status;
+    json["enable_blind1"] = enable_blind1;
+    json["enable_blind2"] = enable_blind2;
+    json["enable_blind3"] = enable_blind3;
+    json["blind1_0_offset"] = blind1_0_offset;
+    json["blind2_0_offset"] = blind2_0_offset;
+    json["blind3_0_offset"] = blind3_0_offset;
+    json["configure_flag"] = "1";  //1=configured
+
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+      Serial.println("failed to open config file for writing");
+    }
+
+    json.printTo(Serial);
+    json.printTo(configFile);
+    configFile.close();
+    debug and Serial.println("");
+    //end save
+  }
+
+  /* print out our voltage */
+  //for bare esp module: float vdd = ESP.getVcc() / 1000.0;  /* Read VCC voltage */
+  //Nodemcu esp module. has resister pullup.
+  //float vdd = ((float)ESP.getVcc())/1024;
+  
+  //debug and Serial.print("Voltage: ");
+  //debug and Serial.println(vdd);
+
+  moveblinds(CLOSEUP);         // call function to close all blinds on power up.
+  blind1="CloseUP";
+  Alarm.timerOnce(10, MQTT_RECONNECT);              // Connect 10 seconds after startup
+  Alarm.timerRepeat(300, MQTT_RECONNECT);           // Check connection to MQTT server every 5 minutes.
+  Alarm.timerRepeat(900, MQTT_PUBLISH);             // Send Blind state every 15 minutes.
+
+  /* Print out variables */
+  debug and Serial.println(mqtt_server);
+  debug and Serial.println(mqtt_port);
+  debug and Serial.println(mqtt_token);
+  debug and Serial.println(topic_setting);
+  debug and Serial.println(topic_status);
+  debug and Serial.println(enable_blind1);
+  debug and Serial.println(enable_blind2);
+  debug and Serial.println(enable_blind3);
+  debug and Serial.println(blind1_0_offset);
+  debug and Serial.println(blind2_0_offset);
+  debug and Serial.println(blind3_0_offset);
+
+  client.setServer(mqtt_server, atoi(mqtt_port));
+  client.setCallback(callback);
+
+}  //End setup
+
+
+/*------------------------------------Functions------------------------------------------*/
+/* Need to move to header */
 void moveblinds(int value) {
-#ifdef SERVO1
-        delay(60);
-        debug and Serial.print("Moving blind1 to: ");
-        debug and Serial.println(value);
-        myservo.attach(servoPin1);
-        yield();
-        myservo.write(value);
-        delay(600); 
-        myservo.detach();
-#endif
-#ifdef SERVO2
-        delay(60);
-        debug and Serial.print("Moving blind2 to: ");
-        debug and Serial.println(value);
-        myservo.attach(servoPin2);
-        myservo.write(value);
-        delay(600); 
-        myservo.detach();
-#endif
-#ifdef SERVO3
-        delay(60);
-        debug and Serial.print("Moving blind3 to: ");
-        debug and Serial.println(value);
-        myservo.attach(servoPin3);
-        myservo.write(value);
-        delay(600); 
-        myservo.detach();
-#endif     
+  if (atoi(enable_blind1)) {
+    delay(60);
+    int b1_value=value;
+    if (atoi(blind1_0_offset) != 90 && value == OPEN) {  // Set new open value. 
+       b1_value = atoi(blind1_0_offset);
+       debug and Serial.println("B1 here1");
+    }
+    if (atoi(blind1_0_offset) > 90 && value == HALF) {  // Calculate new half open value if offset is > 90.
+       b1_value = value+(atoi(blind1_0_offset)-90);
+       debug and Serial.println("B1 here2");
+    }
+    if (atoi(blind1_0_offset) < 90 && value == HALF) {  // Calculate new half open value if offset is < 90.
+       b1_value = value-(90-atoi(blind1_0_offset));
+       debug and Serial.println("B1 here3");
+    }
+    debug and Serial.print("Moving blind1 to: ");
+    debug and Serial.println(b1_value);
+    myservo1.attach(SERVOPIN1);
+    myservo1.write(b1_value);
+    delay(600);
+    myservo1.detach();
+  }
+  if (atoi(enable_blind2)) {
+    delay(60);
+    int b2_value=value;
+    if (atoi(blind2_0_offset) != 90 && value == OPEN) {  // Set new open value. 
+       b2_value = atoi(blind2_0_offset);
+       debug and Serial.println("B2 here1");
+    }
+    if (atoi(blind2_0_offset) > 90 && value == HALF) {  // Calculate new half open value if offset is > 90.
+       b2_value = value+(atoi(blind2_0_offset)-90);
+       debug and Serial.println("B2 here2");
+    }
+    if (atoi(blind2_0_offset) < 90 && value == HALF) {  // Calculate new half open value if offset is < 90.
+       b2_value = value-(90-atoi(blind2_0_offset));
+       debug and Serial.println("B2 here3");
+    }
+    debug and Serial.print("Moving blind2 to: ");
+    debug and Serial.println(b2_value);
+    myservo2.attach(SERVOPIN2);
+    myservo2.write(b2_value);
+    delay(600);
+    myservo2.detach();
+  }
+  if (atoi(enable_blind3)) {
+    delay(60);
+    int b3_value=value;
+    if (atoi(blind3_0_offset) != 90 && value == OPEN) {  // Set new open value. 
+       b3_value = atoi(blind3_0_offset);
+       debug and Serial.println("B3 here1");
+    }
+    if (atoi(blind3_0_offset) > 90 && value == HALF) {  // Calculate new half open value if offset is > 90.
+       b3_value = value+(atoi(blind3_0_offset)-90);
+       debug and Serial.println("B3 here2");
+    }
+    if (atoi(blind3_0_offset) < 90 && value == HALF) {  // Calculate new half open value if offset is < 90.
+       b3_value = value-(90-atoi(blind3_0_offset));
+       debug and Serial.println("B3 here3");
+    }
+    debug and Serial.print("Moving blind3 to: ");
+    debug and Serial.println(b3_value);
+    myservo3.attach(SERVOPIN3);
+    myservo3.write(b3_value);
+    delay(600);
+    myservo3.detach();
+  }
 }
 
+/* Messages from MQTT server */
 void callback(char* topic, byte* payload, unsigned int length) {
   debug and Serial.print("Message arrived: [");
   debug and Serial.print(topic);
   debug and Serial.print(" ]");
   char *payload_string = (char *) payload; // convert mqtt byte array into char array
-  payload_string[length] ='\0';            // Must delimit with 0
-  int payload_int=atoi(payload_string);    // convert char array into int
+  payload_string[length] = '\0';           // Must delimit with 0
+  int payload_int = atoi(payload_string);  // convert char array into int
   debug and Serial.println(payload_int);
 
-  //Adjust blind to setting of payload if between the full sweep of the servo.
-  if ((payload_int >= 0) && (payload_int <= 180)) {
-     moveblinds(payload_int);   // Call function to move the blinds
-     /* MQTT status ranges */
-     if ((payload_int >= 70) && (payload_int <= 120)) {  //Open range
-        client.publish(topic_status, "Open");
-     } else if ((payload_int >= 25) && (payload_int <= 69)) {  //Half range
-        client.publish(topic_status, "Half");
-     } else if ((payload_int >= 0) && (payload_int <= 24)) {  //Close range 
-        client.publish(topic_status, "Closed");
-     } else if (payload_int >= 140) {
-         client.publish(topic_status, "Closedup");
-     } else {
-        client.publish(topic_status, "error");
-        debug and Serial.println("Unknown setting in payload");
-     }
+  /* Take value from MQTT/OPENHAB and break up into open/half/close/closeup */
+  if ((payload_int >= 70) && (payload_int <= 120)) {  //Open range
+     moveblinds(OPEN);   // Call function to move the blinds
+     client.publish(topic_status, "Open");
+     blind1 = "Open";
+  } else if ((payload_int >= 25) && (payload_int <= 69)) {  //Half range
+     moveblinds(HALF);   // Call function to move the blinds
+     client.publish(topic_status, "Half");
+     blind1 = "Half";
+  } else if ((payload_int >= 0) && (payload_int <= 24)) {  //Close range
+     moveblinds(CLOSE);   // Call function to move the blinds 
+     client.publish(topic_status, "Closed");
+     blind1 = "Closed";
+  } else if (payload_int >= 140) {
+     moveblinds(CLOSEUP);   // Call function to move the blinds
+     client.publish(topic_status, "Closedup");
+     blind1 = "Closedup";
+  } else {
+     client.publish(topic_status, "error");
+     debug and Serial.println("Unknown setting in payload");
   }
 }
 
-void reconnect() {
-  // Loop until we're reconnected
-  //while (!client.connected()) {   //comment out so we go through main loop for manual control
-    debug and Serial.print("Attempting MQTT connection...");
-    // Attempt to connect
-    if (client.connect("ESPBlind1")) {
-      debug and Serial.println("connected");
-      client.subscribe(topic_setting);
-    } else {
-      debug and Serial.print("failed, rc=");
-      debug and Serial.print(client.state());
-      debug and Serial.println(" try again in 5 seconds");
-      // Wait 5 seconds before retrying
-      delay(50);
-    }
-  //} 
+void MQTT_PUBLISH() {
+  client.publish(topic_status, (char *) blind1.c_str());
 }
 
-//MAIN LOOP
-void loop(void) { 
-    if (!client.connected()) {
-       delay(10);
-       reconnect();
+void MQTT_RECONNECT() {
+  debug and Serial.println("Check MQTT connection...");
+  if (!client.connected()) {
+    if (client.connect(mqtt_token)) {
+      debug and Serial.println(" Connected");
+      client.subscribe(topic_setting);   // Attempt to subscribe to topic
+      MQTT_PUBLISH();                   // Publish blind status if we have to reconnect because server may not maintain state.
+    } else {
+      debug and Serial.print("failed, rc=");
+      debug and Serial.println(client.state());
     }
-    client.loop();
-    button_value = digitalRead(button_pin); //Query button or relay switch
-    //Define the modes based on button press. Cycle through options
-    if(button_value==LOW){  // button press
-      debug and Serial.println("button pressed: "); 
-      if (next > 4) {
-        next=1;
-      }
-      if (next == 1) { //First pull is OPEN
-        moveblinds(OPEN);  //Move to next position
-        client.publish(topic_status, "Open");   // publish current position
-      } 
-      if (next == 2) { //Second pull is HALF
-        moveblinds(HALF);
-        client.publish(topic_status, "Half");   // publish current position
-      } 
-      if (next == 3) { //Third pull is CLOSE 
-        moveblinds(CLOSE);          
-        client.publish(topic_status, "Closed");   // publish current position          
-      } 
-      if (next == 4) { //Forth pull is CLOSEUP 
-        moveblinds(CLOSEUP);          
-        client.publish(topic_status, "Closedup");   // publish current position          
-      }
-      next++;
-   }
-   delay(60);
+  } else {
+    debug and Serial.println(" Already Connected");
+  }
+}
+
+
+/*---------------------------------main loop---------------------------------------*/
+void loop() {
+  client.loop();
+  // put your main code here, to run repeatedly:
+  //If we press config button clear out wifi settings so we enter config more
+  if ( digitalRead(TRIGGER_PIN) == LOW ) {
+    Serial.println("\n Entering WIFI setup.\n");
+    delay(2000);
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& json = jsonBuffer.createObject();
+    json["mqtt_server"] = mqtt_server;
+    json["mqtt_port"] = mqtt_port;
+    json["mqtt_token"] = mqtt_token;
+    json["topic_setting"] = topic_setting;
+    json["topic_status"] = topic_status;
+    json["enable_blind1"] = enable_blind1;
+    json["enable_blind2"] = enable_blind2;
+    json["enable_blind3"] = enable_blind3;
+    json["blind1_0_offset"] = blind1_0_offset;
+    json["blind2_0_offset"] = blind2_0_offset;
+    json["blind3_0_offset"] = blind3_0_offset;
+    json["configure_flag"] = "0";
+    File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+      Serial.println("failed to open config file for writing");
+    }
+    json.printTo(Serial);
+    json.printTo(configFile);
+    configFile.close();
+    //end save
+    delay(500);
+    ESP.reset();
+  }  /* End setup check */
+  
+  button_value = digitalRead(BUTTON_PIN); //Query button or relay switch
+  //Define the modes based on button press. Cycle through options
+  if (button_value == LOW) { // button press
+    debug and Serial.println("button pressed: ");
+    if (next > 4) {
+      next = 1;
+    }
+    if (next == 1) { //First pull is OPEN
+      moveblinds(OPEN);  //Move to next position
+      blind1 = "Open";
+      client.publish(topic_status, "Open");   // publish current position
+      //client.publish(topic_status, blind1.c_str());   // publish current position
+      //MQTT_PUBLISH();     // publish current position
+    }
+    if (next == 2) { //Second pull is HALF
+      moveblinds(HALF);
+      blind1 = "Half";
+      client.publish(topic_status, "Half");   // publish current position
+      //client.publish(topic_status, blind1.c_str());   // publish current position
+      //MQTT_PUBLISH();      // publish current position
+    }
+    if (next == 3) { //Third pull is CLOSE
+      moveblinds(CLOSE);
+      blind1 = "Close";
+      client.publish(topic_status, "Closed");   // publish current position
+      //client.publish(topic_status, blind1.c_str());   // publish current position
+      //MQTT_PUBLISH();     // publish current position
+    }
+    if (next == 4) { //Forth pull is CLOSEUP
+      moveblinds(CLOSEUP);
+      blind1 = "Closeup";
+      client.publish(topic_status, "Closedup");   // publish current position
+      //client.publish(topic_status, blind1.c_str());   // publish current position
+      //MQTT_PUBLISH();    // publish current position
+    }
+    next++;
+  }
+  Alarm.delay(20);
+  ESP.wdtFeed();
 }
