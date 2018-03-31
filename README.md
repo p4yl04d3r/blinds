@@ -23,6 +23,7 @@
 
 The Servo mount is designed to fit inside of 2" venetian blinds.
   Thingivers Blind server mount: https://www.thingiverse.com/thing:1573867
+
 The gears work with 6mm square rod.
   Thingivers Blind gears: https://www.thingiverse.com/thing:2766199
 
