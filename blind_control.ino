@@ -26,7 +26,7 @@
  *   Arduino Core ESP8266 - 2.3.0
  *   Wifi Manager         - 0.12.0
  *   Board: NodeMCU 1.0
- *          Flash: 4M (1M SPIFFS)
+ *          Flash: 4mbit (1M SPIFFS)
  *          Freq:  80mhz
  *          Baud:  115200
  *          
@@ -35,16 +35,19 @@
  *   ----------------------------------------------------
  *   Reset      RST     Reset pin
  *    0         D3      Trigger Configuration manager
- *    4         D2      Pull cord blind toggle switch
- *    12        D6      Server control for Blind2
- *    13        D7      Server control for Blind1
- *    14        D5      Server control for Blind3
+ *    4         D2      Pull cord blind toggle switch (Local control)
+ *    12        D6      Servo data pin for Blind2
+ *    13        D7      Servo data pin for Blind1
+ *    14        D5      Servo data pin for Blind3
  *    
  * Updates:
  * 07/05/2016 - Inital public release
  * 01/22/2018 - Added Wifi manager
  *              A way to adjust the open tilt angle when working with blind clusters
  *              Code cleanup
+ * 03/31/2018 - Renamed "mqtt_token" to "mqtt_client" per feedback from community. 
+ *              Fixed spelling errors in comments.
+ *              
  ******************************************************************************************************/
 #include <FS.h>                   //this needs to be first, or it all crashes and burns...
 #include <ESP8266WiFi.h>          //https://github.com/esp8266/Arduino
@@ -71,10 +74,11 @@ int debug = 1;            //Set this to 1 for serial debug output
 
 //define your default values here, if there are different values in config.json, they are overwritten.
 char mqtt_server[40]    = "192.168.10.155"; // MQTT Server address
+char Custom_SSID[12]    = "Wblind-AP";      // SSID for Management portal when in config mode.
 char mqtt_port[6]       = "1883";           // MQTT Port number
-char mqtt_token[34]     = "MQTT_TOKEN";     // Used for password token
-char topic_setting[40]  = "setting";        // MQTT SUBSCRIBE path to get openhab changes.
-char topic_status[40]   = "status";         // MQTT PUBLISG path to post blind status.
+char mqtt_client[34]     = "MQTT_Client";   // MQTT client name
+char topic_setting[40]  = "setting";        // MQTT SUBSCRIBE: Blind callback for control from openhab.
+char topic_status[40]   = "status";         // MQTT PUBLISH: Blind sends current position (local control). 
 char enable_blind1[2]   = "1";              // 1=Enable 0=Disable blind1
 char enable_blind2[2]   = "1";              // 1=Enable 0=Disable blind2
 char enable_blind3[2]   = "1";              // 1=Enable 0=Disable blind3
@@ -145,7 +149,7 @@ void setup() {
 
           strcpy(mqtt_server, json["mqtt_server"]);
           strcpy(mqtt_port, json["mqtt_port"]);
-          strcpy(mqtt_token, json["mqtt_token"]);
+          strcpy(mqtt_client, json["mqtt_client"]);
           strcpy(topic_setting, json["topic_setting"]);
           strcpy(topic_status, json["topic_status"]);
           strcpy(enable_blind1, json["enable_blind1"]);
@@ -171,7 +175,7 @@ void setup() {
   // id/name placeholder/prompt default length
   WiFiManagerParameter custom_mqtt_server("server", "mqtt server", mqtt_server, 40);
   WiFiManagerParameter custom_mqtt_port("port", "mqtt port", mqtt_port, 5);
-  WiFiManagerParameter custom_mqtt_token("mqtt", "mqtt token", mqtt_token, 32);
+  WiFiManagerParameter custom_mqtt_client("mqtt", "mqtt client", mqtt_client, 32);
   WiFiManagerParameter custom_topic_setting("blind1_sub", "mqtt blind1 sub", topic_setting, 40);
   WiFiManagerParameter custom_topic_status("blind1_pub", "mqtt blind1 pub", topic_status, 40);
   WiFiManagerParameter custom_enable_blind1("enable_blind1", "Enable blind 1", enable_blind1, 2);
@@ -197,7 +201,7 @@ void setup() {
   wifiManager.addParameter(&custom_text1);
   wifiManager.addParameter(&custom_mqtt_server);
   wifiManager.addParameter(&custom_mqtt_port);
-  wifiManager.addParameter(&custom_mqtt_token);
+  wifiManager.addParameter(&custom_mqtt_client);
   WiFiManagerParameter custom_text2("<p>Blind setup</p>");
   wifiManager.addParameter(&custom_text2);
   wifiManager.addParameter(&custom_topic_setting);
@@ -207,7 +211,7 @@ void setup() {
   wifiManager.addParameter(&custom_enable_blind1);
   wifiManager.addParameter(&custom_enable_blind2);
   wifiManager.addParameter(&custom_enable_blind3);
-  WiFiManagerParameter custom_text4("<p>Blind midpoint between 87 and 93. 90 is midpoint</p>");
+  WiFiManagerParameter custom_text4("<p>Blind midpoint between 87 and 93. 90(Default) is midpoint</p>");
   wifiManager.addParameter(&custom_text4);
   wifiManager.addParameter(&custom_blind1_0_offset);
   wifiManager.addParameter(&custom_blind2_0_offset);
@@ -246,8 +250,8 @@ void setup() {
   //if it does not connect it starts an access point with the specified name
   //here  "Wblind-AP"
   //and goes into a blocking loop awaiting configuration
-  if (!wifiManager.autoConnect("Wblind-AP", "password")) {
-    Serial.println("failed to connect and hit timeout");
+  if (!wifiManager.autoConnect(Custom_SSID, "password")) {
+    Serial.println("Failed to connect timeout reached. Resetting ESP.");
     delay(3000);
     //reset and try again, or maybe put it to deep sleep
     ESP.reset();
@@ -255,14 +259,14 @@ void setup() {
   }
   
   //if you get here you have connected to the WiFi
-  debug and Serial.println("connected...yeey :)");
-  debug and Serial.println("local ip");
+  debug and Serial.println("Connected.");
+  debug and Serial.print("Local IP: ");
   debug and Serial.println(WiFi.localIP());
   
-  //read updated parameters
+  //Print out retrieved/modified parameters to be stored to flash.
   strcpy(mqtt_server, custom_mqtt_server.getValue());
   strcpy(mqtt_port, custom_mqtt_port.getValue());
-  strcpy(mqtt_token, custom_mqtt_token.getValue());
+  strcpy(mqtt_client, custom_mqtt_client.getValue());
   strcpy(topic_setting, custom_topic_setting.getValue());
   strcpy(topic_status, custom_topic_status.getValue());
   strcpy(enable_blind1, custom_enable_blind1.getValue());
@@ -273,14 +277,14 @@ void setup() {
   strcpy(blind3_0_offset, custom_blind3_0_offset.getValue());
   strcpy(configure_flag, custom_configure_flag.getValue());
 
-  //save the custom parameters to FS
+  //Save the custom parameters to flash.
   if (shouldSaveConfig) {
     Serial.println("saving config");
     DynamicJsonBuffer jsonBuffer;
     JsonObject& json = jsonBuffer.createObject();
     json["mqtt_server"] = mqtt_server;
     json["mqtt_port"] = mqtt_port;
-    json["mqtt_token"] = mqtt_token;
+    json["mqtt_client"] = mqtt_client;
     json["topic_setting"] = topic_setting;
     json["topic_status"] = topic_status;
     json["enable_blind1"] = enable_blind1;
@@ -313,14 +317,14 @@ void setup() {
 
   moveblinds(CLOSEUP);         // call function to close all blinds on power up.
   blind1="CloseUP";
-  Alarm.timerOnce(10, MQTT_RECONNECT);              // Connect 10 seconds after startup
-  Alarm.timerRepeat(300, MQTT_RECONNECT);           // Check connection to MQTT server every 5 minutes.
-  Alarm.timerRepeat(900, MQTT_PUBLISH);             // Send Blind state every 15 minutes.
+  Alarm.timerOnce(10, MQTT_RECONNECT);              // Connect to MQTT broker 10 seconds after startup.
+  Alarm.timerRepeat(300, MQTT_RECONNECT);           // Check connection to MQTT broker every 5 minutes.
+  Alarm.timerRepeat(900, MQTT_PUBLISH);             // Send Blind state every 15 minutes to broker.
 
   /* Print out variables */
   debug and Serial.println(mqtt_server);
   debug and Serial.println(mqtt_port);
-  debug and Serial.println(mqtt_token);
+  debug and Serial.println(mqtt_client);
   debug and Serial.println(topic_setting);
   debug and Serial.println(topic_status);
   debug and Serial.println(enable_blind1);
@@ -447,7 +451,7 @@ void MQTT_PUBLISH() {
 void MQTT_RECONNECT() {
   debug and Serial.println("Check MQTT connection...");
   if (!client.connected()) {
-    if (client.connect(mqtt_token)) {
+    if (client.connect(mqtt_client)) {
       debug and Serial.println(" Connected");
       client.subscribe(topic_setting);   // Attempt to subscribe to topic
       MQTT_PUBLISH();                   // Publish blind status if we have to reconnect because server may not maintain state.
@@ -473,7 +477,7 @@ void loop() {
     JsonObject& json = jsonBuffer.createObject();
     json["mqtt_server"] = mqtt_server;
     json["mqtt_port"] = mqtt_port;
-    json["mqtt_token"] = mqtt_token;
+    json["mqtt_client"] = mqtt_client;
     json["topic_setting"] = topic_setting;
     json["topic_status"] = topic_status;
     json["enable_blind1"] = enable_blind1;
