@@ -48,6 +48,8 @@
  * 03/31/2018 - Renamed "mqtt_token" to "mqtt_client" per feedback from community. 
  *              Fixed spelling errors in comments.
  *              
+ * 09/29/2018 - Added debounce to config pin and toggle pin.
+ *              
  ******************************************************************************************************/
 #include <FS.h>                   //this needs to be first, or it all crashes and burns...
 #include <ESP8266WiFi.h>          //https://github.com/esp8266/Arduino
@@ -59,10 +61,11 @@
 #include <PubSubClient.h>
 #include <TimeLib.h>
 #include <TimeAlarms.h>
+#include <Bounce2.h>
 
 /* Define ESP8266 PIN assignments */
 //ADC_MODE(ADC_VCC);          /* Setup ADC pin to read VCC voltage (broken in current CC */
-#define TRIGGER_PIN 0         /* Pin used to put the esp into configuration portal */
+#define CONFIG_PIN  0         /* Pin used to put the esp into configuration portal */
 #define BUTTON_PIN  4         /* Pin used as the pull cord to move blinds locally */
 /* Configure GPIO servo pins */
 #define SERVOPIN1 13          /* Pin for servo1 */
@@ -114,11 +117,20 @@ Servo myservo3;                       // create servo object for servo3
 WiFiClient espClient1;
 PubSubClient client(espClient1);
 
+// Instantiate a Bounce object
+Bounce debouncer1 = Bounce(); //Config button
+Bounce debouncer2 = Bounce(); //Blind toggle switch
  /*--------------------------------------------Setup-----------------------------------*/
 void setup() {
-  pinMode(TRIGGER_PIN, INPUT);
+  pinMode(CONFIG_PIN, INPUT);
   pinMode(BUTTON_PIN, INPUT_PULLUP);
-  // put your setup code here, to run once:
+
+  // Setup the Bounce instance :
+  debouncer1.attach(CONFIG_PIN);
+  debouncer1.interval(5); // interval in ms
+  debouncer2.attach(BUTTON_PIN);
+  debouncer2.interval(10); // interval in ms
+  
   Serial.begin(115200);
   debug and Serial.println();
 
@@ -467,10 +479,11 @@ void MQTT_RECONNECT() {
 
 /*---------------------------------main loop---------------------------------------*/
 void loop() {
-  client.loop();
-  // put your main code here, to run repeatedly:
-  //If we press config button clear out wifi settings so we enter config more
-  if ( digitalRead(TRIGGER_PIN) == LOW ) {
+  client.loop();  //refresh mqtt
+  debouncer1.update(); //Update Debounce1 for Config pin
+  debouncer2.update(); //Update Debounce2 for blind toggle switch
+  //If we press config button clear out wifi settings so we enter config mode
+  if ( debouncer1.read() == LOW ) {
     Serial.println("\n Entering WIFI setup.\n");
     delay(2000);
     DynamicJsonBuffer jsonBuffer;
@@ -499,7 +512,7 @@ void loop() {
     ESP.reset();
   }  /* End setup check */
   
-  button_value = digitalRead(BUTTON_PIN); //Query button or relay switch
+  button_value = debouncer2.read(); //Query blind toggle switch
   //Define the modes based on button press. Cycle through options
   if (button_value == LOW) { // button press
     debug and Serial.println("button pressed: ");
