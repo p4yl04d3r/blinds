@@ -22,9 +22,10 @@
  * I am using Masquito as the MQTT broker (any will work) and OpenHab as the backend.
  * See the readme.md for more info on the project and source files for Openhab and the blind server mounts.
  * 
- * Arduino IDE settings:
- *   Arduino Core ESP8266 - 2.3.0
- *   Wifi Manager         - 0.12.0
+ * Arduino IDE settings   - 1.8.9
+ *   Arduino Core ESP8266 - 2.5.2
+ *   Wifi Manager         - 0.14.0
+ *   ArduinoJson          - 6.x
  *   Board: NodeMCU 1.0
  *          Flash: 4mbit (1M SPIFFS)
  *          Freq:  80mhz
@@ -137,6 +138,7 @@ void setup() {
   //clean FS, for testing
   //SPIFFS.format();
 
+
   //read configuration from FS json
   debug and Serial.println("mounting FS...");
 
@@ -153,27 +155,26 @@ void setup() {
         std::unique_ptr<char[]> buf(new char[size]);
 
         configFile.readBytes(buf.get(), size);
-        DynamicJsonBuffer jsonBuffer;
-        JsonObject& json = jsonBuffer.parseObject(buf.get());
-        json.printTo(Serial);
-        if (json.success()) {
+        DynamicJsonDocument jsonBuffer(1024);
+        DeserializationError error = deserializeJson(jsonBuffer,buf.get());
+        if (!error) {
           debug and Serial.println("\nparsed json");
 
-          strcpy(mqtt_server, json["mqtt_server"]);
-          strcpy(mqtt_port, json["mqtt_port"]);
-          strcpy(mqtt_client, json["mqtt_client"]);
-          strcpy(topic_setting, json["topic_setting"]);
-          strcpy(topic_status, json["topic_status"]);
-          strcpy(enable_blind1, json["enable_blind1"]);
-          strcpy(enable_blind2, json["enable_blind2"]);
-          strcpy(enable_blind3, json["enable_blind3"]);
-          strcpy(blind1_0_offset, json["blind1_0_offset"]);
-          strcpy(blind2_0_offset, json["blind2_0_offset"]);
-          strcpy(blind3_0_offset, json["blind3_0_offset"]);
-          strcpy(configure_flag, json["configure_flag"]);
+          strcpy(mqtt_server, jsonBuffer["mqtt_server"]);
+          strcpy(mqtt_port, jsonBuffer["mqtt_port"]);
+          strcpy(mqtt_client, jsonBuffer["mqtt_client"]);
+          strcpy(topic_setting, jsonBuffer["topic_setting"]);
+          strcpy(topic_status, jsonBuffer["topic_status"]);
+          strcpy(enable_blind1, jsonBuffer["enable_blind1"]);
+          strcpy(enable_blind2, jsonBuffer["enable_blind2"]);
+          strcpy(enable_blind3, jsonBuffer["enable_blind3"]);
+          strcpy(blind1_0_offset, jsonBuffer["blind1_0_offset"]);
+          strcpy(blind2_0_offset, jsonBuffer["blind2_0_offset"]);
+          strcpy(blind3_0_offset, jsonBuffer["blind3_0_offset"]);
+          strcpy(configure_flag, jsonBuffer["configure_flag"]);
 
         } else {
-          Serial.println("failed to load json config");
+          Serial.println("Failed to load json config");
         }
       }
     }
@@ -292,28 +293,28 @@ void setup() {
   //Save the custom parameters to flash.
   if (shouldSaveConfig) {
     Serial.println("saving config");
-    DynamicJsonBuffer jsonBuffer;
-    JsonObject& json = jsonBuffer.createObject();
-    json["mqtt_server"] = mqtt_server;
-    json["mqtt_port"] = mqtt_port;
-    json["mqtt_client"] = mqtt_client;
-    json["topic_setting"] = topic_setting;
-    json["topic_status"] = topic_status;
-    json["enable_blind1"] = enable_blind1;
-    json["enable_blind2"] = enable_blind2;
-    json["enable_blind3"] = enable_blind3;
-    json["blind1_0_offset"] = blind1_0_offset;
-    json["blind2_0_offset"] = blind2_0_offset;
-    json["blind3_0_offset"] = blind3_0_offset;
-    json["configure_flag"] = "1";  //1=configured
+    DynamicJsonDocument jsonBuffer(1024);
+    jsonBuffer["mqtt_server"] = mqtt_server;
+    jsonBuffer["mqtt_port"] = mqtt_port;
+    jsonBuffer["mqtt_client"] = mqtt_client;
+    jsonBuffer["topic_setting"] = topic_setting;
+    jsonBuffer["topic_status"] = topic_status;
+    jsonBuffer["enable_blind1"] = enable_blind1;
+    jsonBuffer["enable_blind2"] = enable_blind2;
+    jsonBuffer["enable_blind3"] = enable_blind3;
+    jsonBuffer["blind1_0_offset"] = blind1_0_offset;
+    jsonBuffer["blind2_0_offset"] = blind2_0_offset;
+    jsonBuffer["blind3_0_offset"] = blind3_0_offset;
+    jsonBuffer["configure_flag"] = "1";  //1=configured
 
     File configFile = SPIFFS.open("/config.json", "w");
     if (!configFile) {
       Serial.println("failed to open config file for writing");
     }
 
-    json.printTo(Serial);
-    json.printTo(configFile);
+    if (serializeJson(jsonBuffer, configFile) == 0) {
+      Serial.println(F("Failed to write to file"));
+    }
     configFile.close();
     debug and Serial.println("");
     //end save
@@ -322,10 +323,10 @@ void setup() {
   /* print out our voltage */
   //for bare esp module: float vdd = ESP.getVcc() / 1000.0;  /* Read VCC voltage */
   //Nodemcu esp module. has resister pullup.
-  //float vdd = ((float)ESP.getVcc())/1024;
+  float vdd = ((float)ESP.getVcc())/1024;
   
-  //debug and Serial.print("Voltage: ");
-  //debug and Serial.println(vdd);
+  debug and Serial.print("Voltage: ");
+  debug and Serial.println(vdd);
 
   moveblinds(CLOSEUP);         // call function to close all blinds on power up.
   blind1="CloseUP";
@@ -486,26 +487,26 @@ void loop() {
   if ( debouncer1.read() == LOW ) {
     Serial.println("\n Entering WIFI setup.\n");
     delay(2000);
-    DynamicJsonBuffer jsonBuffer;
-    JsonObject& json = jsonBuffer.createObject();
-    json["mqtt_server"] = mqtt_server;
-    json["mqtt_port"] = mqtt_port;
-    json["mqtt_client"] = mqtt_client;
-    json["topic_setting"] = topic_setting;
-    json["topic_status"] = topic_status;
-    json["enable_blind1"] = enable_blind1;
-    json["enable_blind2"] = enable_blind2;
-    json["enable_blind3"] = enable_blind3;
-    json["blind1_0_offset"] = blind1_0_offset;
-    json["blind2_0_offset"] = blind2_0_offset;
-    json["blind3_0_offset"] = blind3_0_offset;
-    json["configure_flag"] = "0";
+    DynamicJsonDocument jsonBuffer(1024);
+    jsonBuffer["mqtt_server"] = mqtt_server;
+    jsonBuffer["mqtt_port"] = mqtt_port;
+    jsonBuffer["mqtt_client"] = mqtt_client;
+    jsonBuffer["topic_setting"] = topic_setting;
+    jsonBuffer["topic_status"] = topic_status;
+    jsonBuffer["enable_blind1"] = enable_blind1;
+    jsonBuffer["enable_blind2"] = enable_blind2;
+    jsonBuffer["enable_blind3"] = enable_blind3;
+    jsonBuffer["blind1_0_offset"] = blind1_0_offset;
+    jsonBuffer["blind2_0_offset"] = blind2_0_offset;
+    jsonBuffer["blind3_0_offset"] = blind3_0_offset;
+    jsonBuffer["configure_flag"] = "0";
     File configFile = SPIFFS.open("/config.json", "w");
     if (!configFile) {
-      Serial.println("failed to open config file for writing");
+      Serial.println(F("Failed to open config file for writing!"));
     }
-    json.printTo(Serial);
-    json.printTo(configFile);
+    if (serializeJson(jsonBuffer, configFile) == 0) {
+      Serial.println(F("Failed to write to file"));
+    }
     configFile.close();
     //end save
     delay(500);
